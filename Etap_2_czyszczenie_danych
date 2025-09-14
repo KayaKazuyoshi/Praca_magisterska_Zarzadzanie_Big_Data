@@ -7,8 +7,8 @@ import string
 
 #ZMIENNE POMOCNICZE
 
-input_folder_path = Path(str(input('Podaj ścieżkę do folderu ze wszystkimi plikami JSON')).replace('"', '').replace("'", ""))
-output_folder_path = Path(str(input('Podaj ścieżkę do folderu zapisu plików JSON po czyszczeniu')).replace('"', '').replace("'", ""))
+input_folder_path = Path(str(input('Podaj ścieżkę do folderu ze wszystkimi plikami JSON: ')).replace('"', '').replace("'", ""))
+output_folder_path = Path(str(input('Podaj ścieżkę do folderu zapisu plików JSON po czyszczeniu: ')).replace('"', '').replace("'", ""))
 output_folder_path.mkdir(exist_ok=True)
 
 all_jsons_dict = {} #słownik do przechowywania par: klucz (nazwa pliku JSON) : wartość (DataFrame utworzony z tego pliku)
@@ -38,6 +38,10 @@ with os.scandir(input_folder_path) as it:
         file_path = entity.path
         file_name = entity.name
         all_jsons_dict[file_name] = {'df_before': pd.read_json(file_path, dtype=str, encoding='utf-8')} #utworzenie zagnieżdżonej struktury: słownik w słowniku
+
+##usunięcie duplikatów po adresie podstrony
+for inner_dict in all_jsons_dict.values():
+    inner_dict['df_before'] = inner_dict['df_before'].drop_duplicates(subset=['url'], ignore_index=True)
 
 ##oznaczenie całkowitej liczby wierszy w każdym z df przed rozpoczęciem czyszczenia
 for inner_dict in all_jsons_dict.values():
