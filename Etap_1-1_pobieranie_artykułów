@@ -1,0 +1,428 @@
+from pathlib import Path
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+import time
+from dateutil import parser as dateparser
+from datetime import datetime
+import json
+import random
+
+#FUNKCJE POMOCNICZE
+##ustawienie losowości do ładowania strony - ominięcie automatycznego blokowania
+def safe_sleep(min_sec=2, max_sec=5):
+    """Losowy sleep, żeby zmniejszyć ryzyko bana."""
+    time.sleep(random.uniform(min_sec, max_sec))
+
+##ustawienie opcji selenium.webdriver
+options = webdriver.ChromeOptions()
+
+options.add_argument(
+    "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/138.0.0.0 Safari/537.36"
+)
+
+##wyłączenie flagi „Automation”
+options.add_argument("--disable-blink-features=AutomationControlled")
+
+##ładowanie selenium.webdriver
+driver_path = Path(str(input('Podaj ścieżkę do chrome driver: ')).replace('"', '').replace("'", ""))
+driver = webdriver.Chrome(service=Service(driver_path), options=options)
+
+#KLASY
+##ogólny scraper
+class BaseScraper:
+    def __init__(self, site_url, next_button_xpath, post_link_xpath, post_container_xpath, date_xpath, login_data=None):
+        self.site_url = site_url
+        self.next_button_xpath = next_button_xpath
+        self.post_link_xpath = post_link_xpath
+        self.post_container_xpath = post_container_xpath
+        self.date_xpath = date_xpath
+        self.login_data = login_data
+
+##opcja logowania (przypadek OKO.press)
+    def login(self):
+        if not self.login_data:
+            return
+
+        driver.get(self.login_data["login_url"])
+        time.sleep(2)
+
+        #wpisanie loginu i hasła
+        driver.find_element(By.XPATH, self.login_data["username_xpath"]).send_keys(self.login_data["username"])
+        driver.find_element(By.XPATH, self.login_data["password_xpath"]).send_keys(self.login_data["password"])
+
+        #znajdź przycisk logowania
+        submit_btn = driver.find_element(By.XPATH, self.login_data["submit_xpath"])
+
+        try:
+            # spróbuj normalnie kliknąć
+            submit_btn.click()
+        except Exception:
+            # jeśli jest błąd (zasłonięty itp.), najpierw przewiń
+            driver.execute_script("arguments[0].scrollIntoView(true);", submit_btn)
+            time.sleep(0.5)
+            try:
+                submit_btn.click()
+            except Exception:
+                #ostateczna próba otworzenia przez JavaScript
+                driver.execute_script("arguments[0].click();", submit_btn)
+
+        time.sleep(3)  # poczekaj aż zaloguje
+
+##funkcja scrapująca stronę
+    def scrap_site(self):
+        # zaloguj się, jeśli potrzebne
+        if self.login_data:
+            self.login()
+
+        driver.get(self.site_url)
+        safe_sleep()
+        links = []
+        
+###rozróżnienie przypadków scrapowania
+        #wszystkie artykuły na jednej stronie
+        if self.next_button_xpath is None:  
+            elems = driver.find_elements(By.XPATH, self.post_link_xpath or "//a")
+            links = [a.get_attribute("href") for a in elems]
+
+        #artykuły ładowanie przez scrolling
+        elif self.next_button_xpath == "dynamic_scroll":
+            last_height = driver.execute_script("return document.body.scrollHeight")
+
+            while True:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                safe_sleep()
+
+                new_height = driver.execute_script("return document.body.scrollHeight")
+                if new_height == last_height:
+                    print("Brak nowych elementów przy scrollowaniu.")
+                    break
+                last_height = new_height
+
+            elems = driver.find_elements(By.XPATH, self.post_link_xpath or "//a")
+            links = [a.get_attribute("href") for a in elems]
+
+        #klasyczny przypadek: ładowanie artykułów przez naciśnięcie „next button”
+        else:  
+            max_count = 1  #ograniczenie ładowania stron w "nieskończoność"
+            count = 0
+            while count < max_count:
+                try:
+                    wait = WebDriverWait(driver, 5)
+                    btn = wait.until(EC.element_to_be_clickable(
+                        (By.XPATH, self.next_button_xpath)
+                    ))
+                    driver.execute_script("arguments[0].click();", btn)
+                    safe_sleep()
+                    count += 1
+                except Exception:
+                    print("Nie ma już przycisku / koniec wyników.")
+                    break
+
+            elems = driver.find_elements(By.XPATH, self.post_link_xpath or "//a")
+            links = [a.get_attribute("href") for a in elems]
+
+        return list(set([l for l in links if l]))  # unikalne, bez None
+
+##funkcja scrapująca kolejne podstrony
+    def scrap_article(self, url, date_xpath=None, start_date=None, end_date=None):
+
+        driver.get(url)
+        safe_sleep()
+        try:
+            #pobranie treści artykułu
+            elem = driver.find_element(By.XPATH, self.post_container_xpath)
+            text = elem.text.strip()
+
+            #pobranie wszystkich linków z treści
+            links_in_text = [
+                a.get_attribute("href")
+                for a in elem.find_elements(By.TAG_NAME, "a")
+                if a.get_attribute("href")
+            ]
+
+            pub_date = None
+            raw_date = None
+            
+            #poszukiwanie daty w metadanych podstrony
+            if date_xpath:
+                try:
+                    date_elem = driver.find_element(By.XPATH, date_xpath)
+
+                    #przypadek 1: poszukiwanie przez meta tag
+                    if date_elem.tag_name == "meta":
+                        raw_date = date_elem.get_attribute("content")
+
+                    #przypadek 2: poszukiwanie wewnątrz JSON-LD
+                    elif date_elem.tag_name == "script":
+                        raw_json = date_elem.get_attribute("innerHTML")
+                        try:
+                            data = json.loads(raw_json)
+                            if isinstance(data, list):
+                                data = data[0]
+                            if "datePublished" in data:
+                                raw_date = data["datePublished"]
+                            elif "@graph" in data:
+                                for obj in data["@graph"]:
+                                    if "datePublished" in obj:
+                                        raw_date = obj["datePublished"]
+                                        break
+                        except Exception as e:
+                            print(f"Błąd parsowania JSON-LD w {url}: {e}")
+                            raw_date = None
+
+                    #przypadek 3: poszukiwanie daty wewnątrz tekstu w elemencie
+                    else:
+                        raw_date = date_elem.text
+
+                    if raw_date:
+                        try:
+                            pub_date = dateparser.parse(raw_date, dayfirst=True, fuzzy=True)
+                        except Exception as e:
+                            print(f"Parser nie rozpoznał daty '{raw_date}' z {url}: {e}")
+
+                except Exception as e:
+                    print(f"Nie udało się pobrać daty z {url}: {e}")
+
+            #wyświetlenie informacji po pobraniu artykułu
+            print(f"[DEBUG] URL: {url}\n  raw_date: {raw_date}\n  pub_date: {pub_date}\n")
+
+            #filtrowanie dat
+            if pub_date and pub_date.tzinfo is not None:
+                pub_date = pub_date.replace(tzinfo=None)
+                if start_date and pub_date < start_date:
+                    return None
+                if end_date and pub_date > end_date:
+                    return None
+
+            return {
+                "url": url,
+                "text": text,
+                "links": list(set(links_in_text)),
+                "date": pub_date
+            }
+
+        except Exception as e:
+            print(f"Nie udało się pobrać treści z {url}: {e}")
+            return None
+
+
+#ZMIENNE POMOCNICZE
+##podanie nazwy użytkownika i hasła do serwisu OKO.press
+username_oko = str(input('Podaj nazwę użytkownika w serwisie OKO.press: '))
+password_oko = str(input('Podaj hasło w serwiei OKO.press: '))
+
+##podanie folderu do zapisu
+output_folder = Path(str(input('Podaj ścieżkę do folderu zapisu plików JSON')).replace('"', '').replace("'", ""))
+
+##słowniki zawierające stronę internetową serwisu i XPATH struktury ładującej kolejne podstrony
+sites_pl_dict = {
+    'AFP Fact Check': {
+        'site_url': 'https://sprawdzam.afp.com/list',
+        'next_button_xpath': '//ul[@class="js-pager__items pager"]//a[@rel="next"]',
+        'post_link_xpath': '//a[contains(@href,"doc.afp.com")]',
+        'post_container_xpath': '//div[contains(@class, "col-12 col-lg-10")]',
+        'date_xpath': '//script[@type="application/ld+json"]'
+    },
+    'Demagog': {
+        'site_url': 'https://demagog.org.pl/fake_news/',
+        'next_button_xpath': '//button[contains(@class, "dg-load-more")]',
+        'post_link_xpath': '//a[contains(@href,"fake_news")]',
+        'post_container_xpath': '//div[contains(@class, "dg-post-content__entry")]',
+        'date_xpath': '//script[@type="application/ld+json" and contains(@class,"yoast-schema-graph")]'
+    },
+    'FakeNews.pl - polityka': {
+        'site_url': 'https://fakenews.pl/polityka/',
+        'next_button_xpath': '//li[@class="next btn"]/a',
+        'post_link_xpath': '//a[contains(@href,"/polityka/")]',
+        'post_container_xpath': '//div[contains(@class, "col-sm-12")]',
+        'date_xpath': '//script[@type="application/ld+json"]'
+    },
+    'FakeNews.pl - spoleczenstwo': {
+        'site_url': 'https://fakenews.pl/spoleczenstwo/',
+        'next_button_xpath': '//li[@class="next btn"]/a',
+        'post_link_xpath': '//a[contains(@href,"/spoleczenstwo/")]',
+        'post_container_xpath': '//div[contains(@class, "col-sm-12")]',
+        'date_xpath': '//script[@type="application/ld+json"]'
+    },
+    'FakeNews.pl - technologia': {
+        'site_url': 'https://fakenews.pl/technologia/',
+        'next_button_xpath': '//li[@class="next btn"]/a',
+        'post_link_xpath': '//a[contains(@href,"/technologia/")]',
+        'post_container_xpath': '//div[contains(@class, "col-sm-12")]',
+        'date_xpath': '//script[@type="application/ld+json"]'
+    },
+    'FakeNews.pl - zdrowie': {
+        'site_url': 'https://fakenews.pl/zdrowie/',
+        'next_button_xpath': '//li[@class="next btn"]/a',
+        'post_link_xpath': '//a[contains(@href,"/zdrowie/")]',
+        'post_container_xpath': '//div[contains(@class, "col-sm-12")]',
+        'date_xpath': '//script[@type="application/ld+json"]'
+    },
+    'FakeNews.pl - srodowisko': {
+        'site_url': 'https://fakenews.pl/srodowisko/',
+        'next_button_xpath': '//li[@class="next btn"]/a',
+        'post_link_xpath': '//a[contains(@href,"/srodowisko/")]',
+        'post_container_xpath': '//div[contains(@class, "col-sm-12")]',
+        'date_xpath': '//script[@type="application/ld+json"]'
+    },
+    'FakeNews.pl - badania': {
+        'site_url': 'https://fakenews.pl/badania/',
+        'next_button_xpath': '//li[@class="next btn"]/a',
+        'post_link_xpath': '//a[contains(@href,"/badania/")]',
+        'post_container_xpath': '//div[contains(@class, "col-sm-12")]',
+        'date_xpath': '//script[@type="application/ld+json"]'
+    },
+    'OKO.press': {
+        'site_url': 'https://oko.press/kategoria/prawda-czy-falsz',
+        'next_button_xpath': '//a[contains(@class,"lowercase") and contains(@class,"hidden") and contains(@class,"md:block")]',
+        'post_link_xpath': None,
+        'post_container_xpath': '//div[contains(@class, "mt-16")]',
+        'date_xpath': '//script[@type="application/ld+json"]',
+        'login_data': {
+            "login_url": "https://oko.press/zaloguj",
+            "username_xpath": '//input[@name="email"]',
+            "password_xpath": '//input[@name="password"]',
+            "submit_xpath": '//button[@id="login"]',
+            "username": username_oko,
+            "password": password_oko
+        }
+    },
+    'Pravda': {
+        'site_url': 'https://pravda.org.pl/artykuly/',
+        'next_button_xpath': 'dynamic_scroll',
+        'post_link_xpath': None,
+        'post_container_xpath': '//div[@data-elementor-type="single-post"]',
+        'date_xpath': '//meta[@property="article:published_time"]/@content'
+    },
+    'Wojownicy Klawiatury': {
+        'site_url': 'https://wojownicyklawiatury.pl/',
+        'next_button_xpath': '//a[@class="page-numbers next"]',
+        'post_link_xpath': None,
+        'post_container_xpath': '//div[contains(@class, "wp-block-post-content")]',
+        'date_xpath': '//meta[@property="article:published_time"]/@content'
+    }
+}
+
+sites_uk_dict = {
+    'FactCheckNI': {
+        'site_url': 'https://factcheckni.org/topics/',
+        'next_button_xpath': '//a[@class="facetwp-page next"]',
+        'post_link_xpath': '//a[contains(@href,"/articles/")]',
+        'post_container_xpath': '//div[contains(@class, "post-content")]',
+        'date_xpath': '//meta[@property="article:published_time"]'
+    },
+    'Ferret Fact Service': {
+        'site_url': 'https://theferret.scot/fact-check/',
+        'next_button_xpath': '//a[contains(@class, "next") and contains(@class, "page-numbers")]',
+        'post_link_xpath': None,
+        'post_container_xpath': '//div[contains(@class, "cs-site-inner")]',
+        'date_xpath': '//meta[@property="article:published_time"]'
+    },
+    'Full Fact': {
+        'site_url': 'https://fullfact.org/latest/',
+        'next_button_xpath': '//ul[@class="pagination"]//li[@class="last page-item"]/a',
+        'post_link_xpath': None,
+        'post_container_xpath': '//div[contains(@class, "row justify-content-md-center")]',
+        'date_xpath': '//meta[@property="article:published_time"]'
+    },
+    'PA Fact Check': {
+        'site_url': 'https://pa.media/pa-fact-check/',
+        'next_button_xpath': None,
+        'post_link_xpath': '//a[contains(@href,"fact-check")]',
+        'post_container_xpath': '//*[@id="primary" and contains(@class, "content-area")]',
+        'date_xpath': '//meta[@property="article:published_time"]'
+    },
+    'Reuters Fact Check': {
+        'site_url': 'https://www.reuters.com/fact-check/',
+        'next_button_xpath': '//span[contains(text(), "Load More Articles")]',
+        'post_link_xpath': '//a[contains(@href,"fact-check")]',
+        'post_container_xpath': '//main[contains(@class, "regular-article-layout__main__1tzD8")]',
+        'date_xpath': '//meta[@property="og:article:published_time"]'
+    }
+}
+
+sites_de_dict = {
+    'AFP Faktencheck': {
+        'site_url': 'https://faktencheck.afp.com',
+        'next_button_xpath': '//*[contains(@class, "custom-loadmore") and contains (@class, "view-more")]',
+        'post_link_xpath': '//a[contains(@href,"doc.afp.com")]',
+        'post_container_xpath': '//div[contains(@class, "col-12 col-lg-10")]',
+        'date_xpath': '//script[@type="application/ld+json"]'
+},
+'CORRECT!V Echtjetzt': {
+    'site_url': 'https://correctiv.org/thema/faktencheck/',
+    'next_button_xpath': 'dynamic_scroll',
+    'post_link_xpath': '//a[contains(@href,"/faktencheck/")]',
+    'post_container_xpath': '//div[contains(@class, "detail__inner")]',
+    'date_xpath': '//meta[@property="article:published_time"]'
+},
+'dpa-Faktencheck': {
+    'site_url': 'https://dpa-factchecking.com/germany/',
+    'next_button_xpath': None,
+    'post_link_xpath': '//a[contains(@href,"germany")]',
+    'post_container_xpath': '//div[contains(@class, "content")]',
+    'date_xpath': '//script[@type="application/ld+json"]'
+}
+}
+
+sites_dicts_list = [sites_pl_dict, sites_uk_dict, sites_de_dict]
+
+scrapers_dict = {}
+collected_data_dict = {}
+
+##ustalenie zakresu dat
+start_date = datetime(2025, 7, 1)
+end_date = datetime(2025, 8, 31, 23, 59, 59)
+
+#FUNKCJA GŁÓWNA
+for country_dict in sites_dicts_list:
+    for source_name, values in country_dict.items():
+        print(f"Scraping {source_name}...\n")
+
+        #inicjalizacja scrapera
+        scraper = BaseScraper(
+            values['site_url'],
+            values['next_button_xpath'],
+            values['post_link_xpath'],
+            values['post_container_xpath'],
+            values['date_xpath'],
+            values.get('login_data')
+        )
+
+        #zebranie linków
+        links = scraper.scrap_site()
+        print(f'Znaleziono linki: {links}')
+
+        #pobieranie artykułów z filtrem dat
+        articles = []
+        for link in links:
+            result = scraper.scrap_article(
+                url=link,
+                date_xpath=values['date_xpath'],
+                start_date=start_date,
+                end_date=end_date
+            )
+            if result:  #None jeśli brak daty albo poza zakresem
+                articles.append({
+                    "source": source_name,
+                    "country": "PL" if source_name in sites_pl_dict else "UK" if source_name in sites_uk_dict else "DE",
+                    "url": result["url"],
+                    "date": result["date"].strftime("%Y-%m-%d") if result["date"] else None,
+                    "text": result["text"],
+                    "links": result["links"]
+                })
+
+        #zapis do pliku JSON
+        if articles:
+            output_file = output_folder / fr"{source_name.replace(' ', '_')}_2025-07-08.json"
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(articles, f, ensure_ascii=False, indent=2)
+
+            print(f"Zapisano {len(articles)} artykułów do {output_file}")
+        else:
+            print(f"Brak artykułów w zakresie dat dla {source_name}")
