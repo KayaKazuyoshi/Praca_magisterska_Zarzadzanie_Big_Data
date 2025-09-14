@@ -1,0 +1,80 @@
+import pandas as pd
+from pathlib import Path
+import os
+import re
+from itertools import permutations
+import string
+
+#ZMIENNE POMOCNICZE
+
+input_folder_path = Path(str(input('Podaj ścieżkę do folderu ze wszystkimi plikami JSON')).replace('"', '').replace("'", ""))
+output_folder_path = Path(str(input('Podaj ścieżkę do folderu zapisu plików JSON po czyszczeniu')).replace('"', '').replace("'", ""))
+output_folder_path.mkdir(exist_ok=True)
+
+all_jsons_dict = {} #słownik do przechowywania par: klucz (nazwa pliku JSON) : wartość (DataFrame utworzony z tego pliku)
+
+##regex - data
+re_separator = r'[-./\\]' #separatory
+re_yyyy = '2025' #oznaczenie roku
+re_mm = '0?(7|8)' #oznaczenie miesiąca (0 na początku alternatywne)
+re_dd = '[0-3]?[1-9]' #oznaczenie dnia (0 na początku alternatywne)
+
+re_dates = []
+
+for combo in permutations([re_yyyy, re_mm, re_dd], 3):
+    re_combo = re_separator.join(combo) #połączenie elementów separatorami
+    re_dates.append(re_combo)
+
+re_dates = '|'.join(re_dates) #utworzenie jednego regexu z grupami alternatywnymi
+
+##regex - białe znaki
+re_whitespaces = f"[{re.escape(string.whitespace.replace(' ', ''))}]" #usunięcie wszystkich białych znaków z wyjątkiem spacji
+
+#CZYSZCZENIE DANYCH
+
+##wczytanie danych
+with os.scandir(input_folder_path) as it:
+    for entity in it:
+        file_path = entity.path
+        file_name = entity.name
+        all_jsons_dict[file_name] = {'df_before': pd.read_json(file_path, dtype=str, encoding='utf-8')} #utworzenie zagnieżdżonej struktury: słownik w słowniku
+
+##oznaczenie całkowitej liczby wierszy w każdym z df przed rozpoczęciem czyszczenia
+for inner_dict in all_jsons_dict.values():
+    inner_dict['len_df_before'] = len(inner_dict['df_before'])
+
+##sprawdzenie, w każdym wierszu badanych DataFrames znajduje się przynajmniej jedno odniesienie do dat z określonego zakresu (patrz: regex)
+for inner_dict in all_jsons_dict.values():
+    inner_dict['df_before']['is_date'] = inner_dict['df_before'].apply(
+            lambda row: any(re.search(re_dates, str(v)) for v in row.values),
+            axis=1
+        )
+
+##usunięcie wierszy nieposiadających odniesienia do daty
+for inner_dict in all_jsons_dict.values():
+    mask = inner_dict['df_before']['is_date']  #warunek: pozostawienie tylko tych wierszy w DataFrames, których kolumna ['is_date'] ==  True
+    inner_dict['df_after'] = inner_dict['df_before'][mask]
+    inner_dict['len_df_after'] = len(inner_dict['df_after']) #przeliczenie wierszy DataFrames, które spełniają warunek daty
+    inner_dict['df_after']['text'] = inner_dict['df_after']['text'].apply(lambda x: re.sub(re_whitespaces, '', str(x))) ##usunięcie białych znaków z pola tekstowego
+
+##sprawdzenie liczby wierszy znajdujących się w poszczególnych DataFrames przed i po czyszczeniu
+all_lens_list = []
+
+for file_name, inner_dict in all_jsons_dict.items():
+    all_lens_list.append({
+        'file_name': file_name,
+        'len_df_before': inner_dict['len_df_before'],
+        'len_df_after': inner_dict['len_df_after']
+    })
+
+all_lens_df = pd.DataFrame(all_lens_list)
+
+##zapis finalnych DataFrames
+all_lens_file_name = 'all_lens_comparison.json'
+all_lens_file_path = output_folder_path / all_lens_file_name
+all_lens_df.to_json(all_lens_file_path, index=False, orient='records')
+
+for file_name, inner_dict in all_jsons_dict.items():
+    output_file_name = file_name
+    output_file_path = output_folder_path / output_file_name
+    inner_dict['df_after'].to_json(output_file_path, index=False, orient='records')
