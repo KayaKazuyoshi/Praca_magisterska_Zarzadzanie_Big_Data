@@ -102,10 +102,10 @@ def scrap_article(url, post_container_xpath, date_xpath=None):
 
 #ZMIENNE POMOCNICZE
 ##podanie folderu do zapisu
-output_folder = Path(str(input('Podaj ścieżkę do folderu zapisu plików JSON')).replace('"', '').replace("'", ""))
+output_folder = Path(str(input('Podaj ścieżkę do folderu zapisu plików JSON: ')).replace('"', '').replace("'", ""))
 
 ##podanie folderu z zapisanymi stronami w formie plików tekstowych
-input_folder = Path(str(input('Podaj ścieżkę do folderu zapisu plików JSON')).replace('"', '').replace("'", ""))
+input_folder = Path(str(input('Podaj ścieżkę do folderu z plikami txt: ')).replace('"', '').replace("'", ""))
 
 ##słowniki z danymi
 sites_local_dict = {
