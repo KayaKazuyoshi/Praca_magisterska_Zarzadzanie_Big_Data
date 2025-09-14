@@ -1,0 +1,259 @@
+import json
+from lxml import html
+from urllib.parse import urljoin
+import requests
+from bs4 import BeautifulSoup
+import random
+import time
+from pathlib import Path
+
+#FUNKCJE POMOCNICZE
+##ustawienie losowości do ładowania strony - ominięcie automatycznego blokowania
+def safe_sleep(min_sec=2, max_sec=5):
+    """Losowy sleep, żeby zmniejszyć ryzyko bana."""
+    time.sleep(random.uniform(min_sec, max_sec))
+
+##ustawienie opcji requests
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/115.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.google.com/",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Connection": "keep-alive",
+}
+
+##wyciągnięcie linków z zapisanych plików tekstowych z kodem strony
+def get_links_from_file(file_path, site_url, post_link_xpath=None):
+    with open(file_path, "r", encoding="utf-8") as f:
+        page_html = f.read()
+
+    tree = html.fromstring(page_html)
+
+    if post_link_xpath:
+        elems = tree.xpath(post_link_xpath)
+        links = [a.get("href") for a in elems if a.get("href")]
+    else:
+        elems = tree.xpath("//a[@href]")
+        links = [a.get("href") for a in elems if a.get("href")]
+
+    #absolutyzacja
+    links = [urljoin(site_url, l) for l in links]
+    return list(set(links))
+
+##funkcja scrapująca kolejne podstrony
+def scrap_article(url, post_container_xpath, date_xpath=None):
+    """Ściąga artykuł: treść + data (jeśli jest) + linki z treści."""
+    safe_sleep()
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+
+        resp = session.get(url, timeout=20)
+        resp.raise_for_status()
+        page_html = resp.content
+
+    except Exception as e:
+        print(f"Błąd pobierania {url}: {e}")
+        return None
+
+    tree = html.fromstring(page_html)
+    soup = BeautifulSoup(page_html, "html.parser")
+
+    #wyciągnięcie treści artykułu
+    text_elems = tree.xpath(post_container_xpath)
+    if not text_elems:
+        print(f"Brak treści dla {url}")
+        return None
+    text = " ".join(el.text_content().strip() for el in text_elems)
+
+    #wyciągnięcie linków z artykułu
+    links_in_text = []
+    for el in text_elems:
+        anchors = el.xpath(".//a[@href]")
+        for a in anchors:
+            href = a.get("href")
+            if href:
+                links_in_text.append(urljoin(url, href))
+
+    #wyciagnięcie daty
+    pub_date, raw_date = None, None
+    if date_xpath:
+        date_elems = tree.xpath(date_xpath)
+        if date_elems:
+            if isinstance(date_elems[0], str):
+                raw_date = date_elems[0]
+            else:
+                raw_date = date_elems[0].text or date_elems[0].get("content")
+        pub_date = raw_date
+
+    return {
+        "url": url,
+        "text": text,
+        "date": pub_date,
+        "links": list(set(links_in_text))
+    }
+
+#ZMIENNE POMOCNICZE
+##podanie folderu do zapisu
+output_folder = Path(str(input('Podaj ścieżkę do folderu zapisu plików JSON')).replace('"', '').replace("'", ""))
+
+##podanie folderu z zapisanymi stronami w formie plików tekstowych
+input_folder = Path(str(input('Podaj ścieżkę do folderu zapisu plików JSON')).replace('"', '').replace("'", ""))
+
+##słowniki z danymi
+sites_local_dict = {
+    'Demagog': {
+        'site_url': 'https://demagog.org.pl/fake_news/',
+        'file_path': str(input_folder / r'linki demagog.txt'),
+        'post_link_xpath': '//a[contains(@href,"fake_news")]',
+        'post_container_xpath': '//div[contains(@class, "dg-post-content__entry")]',
+        'date_xpath': '//script[@type="application/ld+json" and contains(@class,"yoast-schema-graph")]',
+        'country': 'PL'
+    },
+    'Reuters Fact Check': {
+        'site_url': 'https://www.reuters.com/fact-check/',
+        'file_path': str(input_folder / 'linki reuters.txt'),
+        'post_link_xpath': '//a[contains(@href,"fact-check")]',
+        'post_container_xpath': '//main[contains(@class, "regular-article-layout__main__1tzD8")]',
+        'date_xpath': '//meta[@property="og:article:published_time"]',
+        'country': 'UK'
+    },
+    'AFP Faktencheck': {
+        'site_url': 'https://faktencheck.afp.com',
+        'file_path': str(input_folder / 'linki afp faktencheck.txt'),
+        'post_link_xpath': '//a[contains(@href,"doc.afp.com")]',
+        'post_container_xpath': '//div[contains(@class, "col-12 col-lg-10")]',
+        'date_xpath': '//script[@type="application/ld+json"]',
+        'country': 'DE'
+    },
+    'dpa factchecking': {
+        'site_url': 'https://dpa-factchecking.com/germany/',
+        'file_path': str(input_folder / 'linki dpa.txt'),
+        'post_link_xpath': '//a[contains(@href,"germany")]',
+        'post_container_xpath': '//div[contains(@class, "content")]',
+        'date_xpath': '//script[@type="application/ld+json"]',
+        'country': 'DE'
+    },
+    'FakeNews.pl - polityka': {
+        'site_url': 'https://fakenews.pl/polityka/',
+        'next_button_xpath': '//li[@class="next btn"]/a',
+        'file_path': str(input_folder / 'polityka.txt'),
+        'post_link_xpath': '//a[contains(@href,"/polityka/")]',
+        'post_container_xpath': '//div[contains(@class, "col-sm-12")]',
+        'date_xpath': '//script[@type="application/ld+json"]',
+        'country': 'PL'
+    },
+    'FakeNews.pl - spoleczenstwo': {
+        'site_url': 'https://fakenews.pl/spoleczenstwo/',
+        'file_path': str(input_folder / 'spoleczenstwo.txt'),
+        'next_button_xpath': '//li[@class="next btn"]/a',
+        'post_link_xpath': '//a[contains(@href,"/spoleczenstwo/")]',
+        'post_container_xpath': '//div[contains(@class, "col-sm-12")]',
+        'date_xpath': '//script[@type="application/ld+json"]',
+        'country': 'PL'
+    },
+    'FakeNews.pl - srodowisko': {
+        'site_url': 'https://fakenews.pl/srodowisko/',
+        'file_path': str(input_folder / 'srodowisko.txt'),
+        'next_button_xpath': '//li[@class="next btn"]/a',
+        'post_link_xpath': '//a[contains(@href,"/srodowisko/")]',
+        'post_container_xpath': '//div[contains(@class, "col-sm-12")]',
+        'date_xpath': '//script[@type="application/ld+json"]',
+        'country': 'PL'
+    },
+    'FactCheckNI': {
+        'site_url': 'https://factcheckni.org/topics/',
+        'file_path': str(input_folder / 'factcheckni.txt'),
+        'next_button_xpath': '//a[@class="facetwp-page next"]',
+        'post_link_xpath': '//a[contains(@href,"/articles/")]',
+        'post_container_xpath': '//div[contains(@class, "post-content")]',
+        'date_xpath': '//meta[@property="article:published_time"]',
+        'country': 'UK'
+    },
+    'Wojownicy Klawiatury 2': {
+        'site_url': 'https://wojownicyklawiatury.pl/',
+        'file_path': str(input_folder / 'wojownicy 2.txt'),
+        'next_button_xpath': '//a[@class="page-numbers next"]',
+        'post_link_xpath': None,
+        'post_container_xpath': '//div[contains(@class, "wp-block-post-content")]',
+        'date_xpath': '//meta[@property="article:published_time"]/@content',
+        'country': 'PL'
+    },
+    'Ferret Fact Service': {
+        'site_url': 'https://theferret.scot/fact-check/',
+        'file_path': str(input_folder / 'ferret.txt'),
+        'next_button_xpath': '//a[contains(@class, "next") and contains(@class, "page-numbers")]',
+        'post_link_xpath': None,
+        'post_container_xpath': '//div[contains(@class, "cs-site-inner")]',
+        'date_xpath': '//meta[@property="article:published_time"]',
+        'country': 'UK'
+    },
+    'Full Fact': {
+        'site_url': 'https://fullfact.org/latest/',
+        'file_path': str(input_folder / 'fullfact.txt'),
+        'next_button_xpath': '//ul[@class="pagination"]//li[@class="last page-item"]/a',
+        'post_link_xpath': None,
+        'post_container_xpath': '//div[contains(@class, "row justify-content-md-center")]',
+        'date_xpath': '//meta[@property="article:published_time"]',
+        'country': 'UK'
+    },
+    'PA Fact Check': {
+        'site_url': 'https://pa.media/pa-fact-check/',
+        'file_path': str(input_folder / 'pamedia.txt'),
+        'next_button_xpath': None,
+        'post_link_xpath': '//a[contains(@href,"fact-check")]',
+        'post_container_xpath': '//*[@id="primary" and contains(@class, "content-area")]',
+        'date_xpath': '//meta[@property="article:published_time"]',
+        'country': 'UK'
+    },
+'CORRECT!V Echtjetzt': {
+    'site_url': 'https://correctiv.org/thema/faktencheck/',
+    'next_button_xpath': 'dynamic_scroll',
+    'file_path': str(input_folder / 'correctiv.txt'),
+    'post_link_xpath': '//a[contains(@href,"/faktencheck/")]',
+    'post_container_xpath': '//div[contains(@class, "detail__inner")]',
+    'date_xpath': '//meta[@property="article:published_time"]',
+    'country': 'DE'
+}
+}
+
+#FUNKCJA GŁÓWNA
+for source_name, values in sites_local_dict.items():
+    print(f"👉 Przetwarzam {source_name}...")
+
+    links = get_links_from_file(
+        values["file_path"],
+        values["site_url"],
+        values["post_link_xpath"]
+    )
+    print(f"   Znalazłem {len(links)} linków")
+
+    articles = []
+    for link in links:
+        result = scrap_article(
+            url=link,
+            post_container_xpath=values["post_container_xpath"],
+            date_xpath=values["date_xpath"]
+        )
+        if result:
+            articles.append({
+                "source": source_name,
+                "country": values.get("country", "PL"),  # domyślnie PL
+                "url": result["url"],
+                "date": result["date"],
+                "text": result["text"],
+                "links": result["links"]
+            })
+
+    out_file = output_folder / fr"{source_name.replace(' ', '_')}_from_txt.json"
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(articles, f, ensure_ascii=False, indent=2)
+
+    print(f"Zapisano {len(articles)} artykułów do {out_file}")
