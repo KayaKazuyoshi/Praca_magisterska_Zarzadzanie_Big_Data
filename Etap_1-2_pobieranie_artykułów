@@ -120,8 +120,8 @@ sites_local_dict = {
     'Reuters Fact Check': {
         'site_url': 'https://www.reuters.com/fact-check/',
         'file_path': str(input_folder / 'linki reuters.txt'),
-        'post_link_xpath': '//a[contains(@href,"fact-check")]',
-        'post_container_xpath': '//main[contains(@class, "regular-article-layout__main__1tzD8")]',
+        'post_link_xpath': '//a[contains(@href,"/fact-check/")]',
+        'post_container_xpath': '//main[contains(@class, "regular-article")]',
         'date_xpath': '//meta[@property="og:article:published_time"]',
         'country': 'UK'
     },
