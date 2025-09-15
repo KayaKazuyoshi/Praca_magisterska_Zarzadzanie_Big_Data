@@ -1,0 +1,475 @@
+import re
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import CountVectorizer
+from transformers import pipeline
+import spacy
+import nltk
+from nltk.sentiment import SentimentIntensityAnalyzer
+import os
+from itertools import combinations
+import matplotlib.pyplot as plt
+import datetime
+from pathlib import Path
+from urllib.parse import urlparse
+
+#FUNKCJE POMOCNICZE
+
+##test zgodności między numpy i openpyxl
+
+if not hasattr(np, "float"):
+    np.float = float
+
+##analiza sentymentu
+
+###model anglojęzyczny: VADER
+nltk.download("vader_lexicon")
+vader = SentimentIntensityAnalyzer()
+
+###model niemieckojęzyczny: german-sentiment-bert
+de_pipe = pipeline("text-classification",
+                   model="oliverguhr/german-sentiment-bert",
+                   tokenizer="oliverguhr/german-sentiment-bert",
+                   top_k=None,
+                   truncation=True,
+                   framework='pt')
+
+###model polskojęzyczny: HerBERT-base
+pl_pipe = pipeline("sentiment-analysis",
+                   model="Voicelab/herbert-base-cased-sentiment",
+                   tokenizer="Voicelab/herbert-base-cased-sentiment",
+                   top_k=None,
+                   truncation=True,
+                   framework='pt')
+
+###wczytanie modelów do Spacy
+nlp_pl = spacy.load("pl_core_news_md")
+nlp_en = spacy.load("en_core_web_md")
+nlp_de = spacy.load("de_core_news_md")
+
+##ustalenie wartości dla sentymentów - teksty anglojęzyczne
+def sentiment_label_en(text: str):
+    scores = vader.polarity_scores(text or "")
+    compound = scores["compound"]
+    if compound >= 0.05:
+        return "pos", compound
+    elif compound <= -0.05:
+        return "neg", compound
+    else:
+        return "neu", compound
+
+##przypisanie etykiet do ustalonego sentymentu
+def sentiment_label_hf(text: str, pipe, lang: str):
+    if not text:
+        return "neu", 0.0
+    out = pipe(text, truncation=True)
+    candidates = out[0] if isinstance(out[0], list) else out
+    best = max(candidates, key=lambda x: x.get("score", 0.0))
+    label = best.get("label", "").lower()
+    score = float(best.get("score", 0.0))
+
+    if "neu" in label or "neutral" in label or "neutralny" in label:
+        return "neu", score
+    if "neg" in label or "negative" in label or "negatywn" in label:
+        return "neg", score
+    if "pos" in label or "positive" in label or "pozytywn" in label:
+        return "pos", score
+    return "neu", score
+
+##obsługa wszystkich modelów SpaCy
+def analyze_sentiment(text, lang):
+    if lang == "UK" or lang == "EN":
+        return sentiment_label_en(text)
+    elif lang == "DE":
+        return sentiment_label_hf(text, de_pipe, "de")
+    elif lang == "PL":
+        return sentiment_label_hf(text, pl_pipe, "pl")
+    else:
+        return "neu", 0.0
+
+##analiza NER
+def analyze_ner(text, lang):
+    if not text:
+        return []
+    if lang == "PL":
+        doc = nlp_pl(text)
+    elif lang == "DE":
+        doc = nlp_de(text)
+    else:
+        doc = nlp_en(text)
+    return [(ent.label_, ent.text) for ent in doc.ents]
+
+##wyciągnięcie linków
+def extract_links(text):
+    if isinstance(text, str):
+        return re.findall(r'https?://[^\s)>\]"\'<]+', text)
+    elif isinstance(text, list):
+        return text  # jeśli już jest lista linków w JSON
+    return []
+
+##wyciągnięcie domen właściwych dla linków
+def url_to_domain(url):
+    try:
+        return urlparse(url).netloc.lower()
+    except:
+        return ""
+
+##pominięcie domeny, z której pochodzi badany link
+def filter_domains(row):
+    src_domain = url_to_domain(str(row.get("source", "")))
+    domains = [url_to_domain(u) for u in row["proper_links"]]
+    return [d for d in domains if d and d != src_domain]
+
+##zamiana obiektów czasu na obiekty pd.Timestamp
+def _strip_tz_scalar(x):
+
+    if isinstance(x, pd.Timestamp):
+        #odcięcie oznaczenia strefy czasowej
+        return x.tz_localize(None) if x.tz is not None else x
+
+    if isinstance(x, datetime.datetime) and x.tzinfo is not None:
+        return x.replace(tzinfo=None)
+    return x
+
+def strip_tz_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # 1) kolumny typu datetime64[ns, tz]
+    for col in out.select_dtypes(include=["datetimetz"]).columns:
+        out[col] = out[col].dt.tz_convert(None)
+
+    # 2) kolumny object – pojedyncze daty lub daty w listach/tuplach
+    for col in out.columns:
+        if out[col].dtype == "object":
+            # sprawdź, czy w kolumnie są jakiekolwiek daty z tz (także w listach/tuplach)
+            has_tz = out[col].apply(
+                lambda v: (
+                    isinstance(v, (pd.Timestamp, datetime.datetime)) and getattr(v, "tzinfo", None) is not None
+                ) or (
+                    isinstance(v, (list, tuple)) and any(
+                        isinstance(i, (pd.Timestamp, datetime.datetime)) and getattr(i, "tzinfo", None) is not None
+                        for i in v
+                    )
+                )
+            ).any()
+            if has_tz:
+                out[col] = out[col].apply(
+                    lambda v: [_strip_tz_scalar(i) for i in v] if isinstance(v, (list, tuple)) else _strip_tz_scalar(v)
+                )
+
+    return out
+
+#FUNKCJA GŁÓWNA
+def process_dataframe(df, name):
+    df = df.copy()
+
+    # długość
+    df["text_len"] = df["text"].fillna("").map(len)
+    df["is_short"] = df["text_len"] < 200
+
+    # sentyment
+    df["sentiment_label"], df["sentiment_score"] = zip(
+        *df.apply(lambda r: analyze_sentiment(r["text"], r["country"]), axis=1)
+    )
+    df["is_neutral_sentiment"] = df["sentiment_label"].eq("neu")
+    df["is_reliable_by_rules"] = df["is_neutral_sentiment"] & (~df["is_short"])
+
+    # linki
+    df["proper_links"] = df["links"].apply(extract_links)
+    df["domains"] = df.apply(filter_domains, axis=1)
+
+    # NER
+    df["ner_ents"] = df.apply(lambda r: analyze_ner(r["text"], r["country"]), axis=1)
+    df["ner_labels_only"] = df["ner_ents"].apply(lambda ents: [lab for lab, _ in ents])
+    df["ner_count"] = df["ner_ents"].apply(len)
+
+    # trigramy
+    vect = CountVectorizer(ngram_range=(3,3), analyzer="word",
+                           lowercase=True, token_pattern=r"(?u)\b\w+\b")
+    X = vect.fit_transform(df["text"].fillna("").astype(str))
+    top_tris = sorted(
+        zip(vect.get_feature_names_out(), np.asarray(X.sum(axis=0)).ravel()),
+        key=lambda x: x[1], reverse=True
+    )[:10]
+    df["trigram_count"] = (X > 0).sum(axis=1).A.ravel()
+
+    # statystyki
+    stats = {
+        "name": name,
+        "mean_len": float(df["text_len"].mean()),
+        "median_len": float(df["text_len"].median()),
+        "mode_len": int(df["text_len"].mode()[0]) if not df["text_len"].mode().empty else 0,
+        "sentiment_counts": df["sentiment_label"].value_counts().to_dict(),
+        "top_trigrams": top_tris
+    }
+    return df, stats
+
+#WYWOŁANIE FUNKCJI GŁÓWNEJ
+
+paths = {}
+
+##podanie folderu z plikami JSON
+input_folder = Path(str(input('Podaj ścieżkę do folderu z plikami JSON: ')).replace('"', '').replace("'", ""))
+
+##podanie folderu do zapisu
+output_folder = Path(str(input('Podaj ścieżkę do folderu zapisu plików po dokonaniu analizy: ')).replace('"', '').replace("'", ""))
+
+with os.scandir(input_folder) as it:
+    for entity in it:
+        entity_name = entity.name.split('.')[0]
+        paths[entity_name] = entity.path
+
+dfs = {name: pd.read_json(path) for name, path in paths.items()}
+
+results = {}
+stats_all = {}
+
+for name, df in dfs.items():
+    df_out, stats = process_dataframe(df, name)
+    results[name] = df_out
+    stats_all[name] = stats
+
+all_df = pd.concat(results.values(), ignore_index=True)
+
+#encje per serwis (zachowane)
+all_ents = {name: set(ent for L in df["ner_ents"] for ent in L) for name, df in results.items()}
+
+#konkretne encje per kraj
+ents_by_country = {}
+for country, group in all_df.groupby("country"):
+    services = group["source"].unique() if "source" in group.columns else [country]
+    ents_by_country[country] = {
+        name: set(ent for L in results[name]["ner_ents"] for ent in L)
+        for name in results.keys()
+        if not results[name].empty and results[name]["country"].iloc[0] == country
+    }
+
+#typy encji per kraj
+ner_entities_by_country = {}
+for country, group in all_df.groupby("country"):
+    ents = group["ner_ents"].explode().dropna()
+    if not ents.empty:
+        ents = ents.apply(lambda x: f"{x[0]}:{x[1]}")
+        ner_entities_by_country[country] = ents.value_counts().head(20)  # top 20 encji per kraj
+
+#typy encji per serwis
+ner_labels_counts = {}
+for name, df in results.items():
+    labels = df["ner_labels_only"].explode()
+    ner_labels_counts[name] = labels.value_counts()
+
+# konkretne encje per serwis
+ner_ents_counts = {}
+for name, df in results.items():
+    ents = df["ner_ents"].explode()  # lista (label, text)
+    ents = ents.dropna()
+    if not ents.empty:
+        ents = ents.apply(lambda x: f"{x[0]}:{x[1]}")
+        ner_ents_counts[name] = ents.value_counts().head(20)  # top 20 encji
+
+#uzyskane statystyki
+global_stats = {
+    "mean_len": float(all_df["text_len"].mean()),
+    "median_len": float(all_df["text_len"].median()),
+    "mode_len": int(all_df["text_len"].mode()[0]) if not all_df["text_len"].mode().empty else 0,
+    "sentiment_counts": all_df["sentiment_label"].value_counts().to_dict()
+}
+
+print(stats_all)
+print(global_stats)
+
+# zbiorcze dane
+all_links = {name: set(link for L in df["links"] for link in L) for name, df in results.items()}
+all_ents = {name: set(ent for L in df["ner_ents"] for ent in L) for name, df in results.items()}
+
+#wspólne linki
+common_links = {}
+for (a, b) in combinations(all_links.keys(), 2):
+    inter = all_links[a] & all_links[b]
+    if inter:
+        common_links[(a, b)] = inter
+
+#wspólne encje
+common_ents = {}
+for (a, b) in combinations(all_ents.keys(), 2):
+    inter = all_ents[a] & all_ents[b]
+    if inter:
+        common_ents[(a, b)] = inter
+
+global_sentiment = all_df["sentiment_label"].value_counts(normalize=True).to_dict()
+
+all_df = strip_tz_df(all_df)
+
+#zapis wyników do kolejnych arkuszy Excela
+with pd.ExcelWriter(os.path.join(output_folder, "full_analysis.xlsx"), engine="openpyxl") as writer:
+    # 1. pełne dane (po wyczyszczeniu dat)
+    all_df.to_excel(writer, sheet_name="Full Data", index=False)
+
+    # 2. statystyki per serwis
+    stats_df = pd.DataFrame(stats_all).T
+    stats_df.to_excel(writer, sheet_name="Stats per Service")
+
+    # 3. globalne statystyki
+    global_stats_df = pd.DataFrame([global_stats])
+    global_stats_df.to_excel(writer, sheet_name="Global Stats", index=False)
+
+    # 4. wspólne linki
+    common_links_df = pd.DataFrame(
+        [(a, b, list(links)) for (a, b), links in common_links.items()],
+        columns=["Service A", "Service B", "Common Links"]
+    )
+    common_links_df.to_excel(writer, sheet_name="Common Links", index=False)
+
+    # 5. wspólne encje
+    common_ents_df = pd.DataFrame(
+        [(a, b, [f"{lab}:{txt}" for (lab, txt) in ents]) for (a, b), ents in common_ents.items()],
+        columns=["Service A", "Service B", "Common Entities"]
+    )
+    common_ents_df.to_excel(writer, sheet_name="Common Entities", index=False)
+
+#TWORZENIE WYKRESÓW
+##sentyment w każdym serwisie
+for name, df in results.items():
+    counts = df["sentiment_label"].value_counts()
+    counts.plot(kind="bar", title=f"Sentyment w {name}")
+    plt.ylabel("Liczba postów")
+    plt.xlabel("Label")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, f"{name}_sentiment.png"))
+    plt.clf()
+
+##globalny sentyment
+all_df["sentiment_label"].value_counts().plot(kind="bar", title="Globalny sentyment")
+plt.ylabel("Liczba postów")
+plt.xlabel("Label")
+plt.tight_layout()
+plt.savefig(os.path.join(output_folder, "global_sentiment.png"))
+plt.clf()
+
+##najczęstsze encje
+all_df["ner_labels_only"].explode().value_counts().head(10).plot(kind="bar", title="10 najczęstszych encji NER")
+plt.ylabel("Liczba wystąpień")
+plt.xlabel("Encja NER")
+plt.tight_layout()
+plt.savefig(os.path.join(output_folder, "top_ner.png"))
+plt.clf()
+
+##typy encji NER per serwis
+for name, counts in ner_labels_counts.items():
+    counts.head(10).plot(kind="bar", title=f"Top encje NER (typy) w {name}")
+    plt.ylabel("Liczba wystąpień")
+    plt.xlabel("Typ encji")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, f"{name}_ner_labels.png"))
+    plt.clf()
+
+##konkretne encje per serwis
+for name, counts in ner_ents_counts.items():
+    counts.plot(kind="bar", title=f"Top encje NER (konkretne) w {name}")
+    plt.ylabel("Liczba wystąpień")
+    plt.xlabel("Encja")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, f"{name}_ner_entities.png"))
+    plt.clf()
+
+##najczęstsze konkretne encje per kraj
+for country, counts in ner_entities_by_country.items():
+    counts.plot(kind="bar", title=f"Top encje NER (konkretne) w kraju: {country}")
+    plt.ylabel("Liczba wystąpień")
+    plt.xlabel("Encja")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, f"{country}_ner_entities.png"))
+    plt.clf()
+
+##trigramy per serwis
+trigrams_per_service = {name: stats["top_trigrams"] for name, stats in stats_all.items()}
+
+##top 10 trigramów per serwis
+for name, tris in trigrams_per_service.items():
+    labels, values = zip(*tris) if tris else ([], [])
+    plt.bar(labels, values)
+    plt.title(f"Top 10 trigramów w {name}")
+    plt.ylabel("Liczba wystąpień")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, f"{name}_trigrams.png"))
+    plt.clf()
+
+##współwystępowanie konkretnych encji per kraj
+common_ents_per_country = {}
+
+for country, services_dict in ents_by_country.items():
+    #zlicz w ilu serwisach występuje każda encja
+    counter = {}
+    for service, ents in services_dict.items():
+        for ent in ents:
+            counter[ent] = counter.get(ent, 0) + 1
+    #sortuj po liczbie serwisów
+    common_ents_per_country[country] = sorted(counter.items(), key=lambda x: x[1], reverse=True)[:20]
+
+for country, ents in common_ents_per_country.items():
+    if ents:
+        #rozbij tuple (('ORG','UE'), count) na 'ORG:UE' i count
+        labels = [f"{lab}:{txt}" for (lab, txt), count in ents]
+        values = [count for (lab, txt), count in ents]
+
+        plt.barh(labels, values)
+        plt.title(f"Encje NER we wspólnych serwisach ({country})")
+        plt.xlabel("Liczba serwisów, w których występuje encja")
+        plt.ylabel("Encja")
+        plt.gca().invert_yaxis()  # najczęstsze na górze
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_folder, f"{country}_ner_common_across_services.png"))
+        plt.clf()
+
+#wykresy sentymentu per kraj
+for country, group in all_df.groupby("country"):
+    counts = group["sentiment_label"].value_counts().reindex(["pos", "neu", "neg"], fill_value=0)
+    # jeśli chcesz sortować w innej kolejności, zmień reindex
+
+    plt.figure(figsize=(6,4))
+    counts.plot(kind="bar", color=["green", "gray", "red"], title=f"Sentyment w kraju: {country}")
+    plt.ylabel("Liczba tekstów")
+    plt.xlabel("Sentyment")
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+    fname = os.path.join(output_folder, f"{country}_sentiment.png")
+    plt.savefig(fname)
+    plt.clf()
+
+##wykresy domen
+###rozwinięcie domen per serwis
+domain_counts_per_service = {}
+for name, df in results.items():
+    all_domains = df["domains"].explode().dropna()
+    if not all_domains.empty:
+        domain_counts_per_service[name] = all_domains.value_counts().head(10)
+
+###wykresy domen per serwis
+for name, counts in domain_counts_per_service.items():
+    counts.plot(kind="bar", title=f"Top domeny linkowane w {name}")
+    plt.ylabel("Liczba linków")
+    plt.xlabel("Domena")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, f"{name}_domains.png"))
+    plt.clf()
+
+###rozwinięcie domen per kraj
+domain_counts_per_country = {}
+for country, group in all_df.groupby("country"):
+    all_domains = group["domains"].explode().dropna()
+    if not all_domains.empty:
+        domain_counts_per_country[country] = all_domains.value_counts().head(10)
+
+###wykresy domen per kraj
+for country, counts in domain_counts_per_country.items():
+    counts.plot(kind="bar", title=f"Top domeny linkowane w kraju: {country}")
+    plt.ylabel("Liczba linków")
+    plt.xlabel("Domena")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, f"{country}_domains.png"))
+    plt.clf()
